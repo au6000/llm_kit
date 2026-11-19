@@ -1,11 +1,12 @@
 [project]
 name = "llm-kit"
-version = "1.0.0"
+version = "2.0.0"
 description = "LLM を呼ぶときに要る機能（プロバイダの切り替え・構造化出力・ストリーミング・利用量の集計・埋め込み・リランク）をひととおり揃えたライブラリ"
 readme = "README.md"
-requires-python = ">=3.12"
+# 3.10 と 3.12 で検査が通ることを 2026-11-19 に確かめた。
+requires-python = ">=3.10"
 
-# import しただけで読み込まれるものだけを必須にする。
+# 部品を使った時点で読み込まれるものだけを必須にする（import llm_kit だけでは読まない）。
 # 下限は、このライブラリが実際に動いていた環境の版。
 dependencies = [
     "langchain-core>=1.5.6",
@@ -25,13 +26,14 @@ vertex-embeddings = ["langchain-google-vertexai"]
 # get_llm("bedrock") と、リランクの Bedrock 経路。
 bedrock = ["langchain-aws", "boto3>=1.43.114"]
 cohere = ["cohere"]
-# query_backend の SqliteBackend。
-sqlite = ["sqlite-vec"]
-all = ["llm-kit[openai,anthropic,google,vertex-embeddings,bedrock,cohere,sqlite]"]
+all = ["llm-kit[openai,anthropic,google,vertex-embeddings,bedrock,cohere]"]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
 
-[tool.hatch.build.targets.wheel]
-packages = ["llm_kit"]
+# このリポジトリの直下が、パッケージ llm_kit そのもの（llm_kit/llm_kit/ と二重にしない）。
+# 検査（tests/）は配る物に入れない。
+[tool.setuptools]
+package-dir = {"llm_kit" = "."}
+packages = ["llm_kit", "llm_kit.providers"]

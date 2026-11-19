@@ -9,7 +9,7 @@
 import asyncio
 import logging
 import warnings
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +17,9 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain_google_vertexai")
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
-from .config import DEFAULT_PROVIDER, DEFAULT_MODELS
+from .config import DEFAULT_PROVIDER
 from .providers import resolve_tool_call_streamer
 from .types import BodyArgResolver
 from .utils import get_model
@@ -122,49 +122,33 @@ def get_llm(
     LangChain ChatModelを取得
 
     Args:
-        provider: プロバイダー名 (openai, anthropic, google, vertex)
-        model: モデル名
+        provider: openai / anthropic / google / vertex / bedrock / claude_code
+            （省略時は config.DEFAULT_PROVIDER）
+        model: モデル名（省略時は config.DEFAULT_MODELS）
         temperature: 温度パラメータ
         max_tokens: 最大トークン数（None ならモデル既定に任せる）
         track_usage: 使用量トラッキング有効化
-        **kwargs: 追加パラメータ
-
-    Returns:
-        BaseChatModel: LangChain ChatModel
+        effort: どれくらい考えさせるか（EFFORT_LEVELS）。provider が持たない値は直下へ丸める
+        thinking_level: effort の古い名前
+        **kwargs: provider の ChatModel にそのまま渡す
 
     Example:
-        # 基本
-        llm = get_llm("vertex", "gemini-2.0-flash")
-        response = llm.invoke("Hello")
+        llm = get_llm("vertex", "gemini-3-flash-preview")
+        print(llm.invoke("Hello").text)
 
-        # Structured Output
-        from pydantic import BaseModel
-
-        class Answer(BaseModel):
-            answer: str
-            confidence: float
-
-        structured_llm = get_llm("openai", "gpt-4o").with_structured_output(Answer)
-        result = structured_llm.invoke("What is 2+2?")
-
-        # Streaming
-        for chunk in llm.stream("Tell me a story"):
-            print(chunk.content, end="", flush=True)
-
-        # LangGraph
+        # LangGraph にもそのまま渡せる
         def call_model(state):
-            llm = get_llm("anthropic", "claude-sonnet-4-20250514")
-            return {"messages": [llm.invoke(state["messages"])]}
+            return {"messages": [get_llm("anthropic", "claude-sonnet-5").invoke(state["messages"])]}
     """
     provider = provider or DEFAULT_PROVIDER
     model = get_model(provider, model)
 
-    # claude_code は CLI が実コストを返すため、自前で usage_tracker に記録する
-    # （PRICING ベースのコールバックは使わない）
     # 「どれくらい考えさせるか」は provider ごとに名前が違う。ここで 1 つに寄せ、
     # 各分岐は自分の形に落とすだけにする。thinking_level は従来の名前で、effort の別名。
     effort = _clamp_effort(_normalize_effort(effort or thinking_level), provider)
 
+    # claude_code は CLI が実コストを返すため、自前で usage_tracker に記録する
+    # （PRICING ベースのコールバックは使わない）
     if provider == "claude_code":
         from .providers.claude_code import ChatClaudeCode
 
@@ -293,6 +277,34 @@ def get_llm(
         raise LLMConfigError(f"Unknown provider: {provider}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# プロンプト 1 本で呼ぶ
+#
+# どれも [SystemMessage(system_prompt)?, HumanMessage(prompt)] を送り、返事は
+# `.text`（文字のブロックだけを繋いだ文字列）で受ける。Gemini 3 などは content を
+# ブロックの list で返すので、`.content` のままだと文字列にならない。
+# 非同期の呼び出しは configure_llm_concurrency の上限の中で待つ。
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _messages(prompt: str, system_prompt: str | None) -> list[BaseMessage]:
+    head = [SystemMessage(content=system_prompt)] if system_prompt else []
+    return [*head, HumanMessage(content=prompt)]
+
+
+async def _limited(awaitable):
+    """configure_llm_concurrency で決めた上限の中で awaitable を待つ。"""
+    if _llm_semaphore is None:
+        return await awaitable
+    async with _llm_semaphore:
+        return await awaitable
+
+
+def _retry_temperature(temperature: float, attempt: int) -> float:
+    """送り直すたびに温度を 0.1 ずつ上げる（上限 1.0）。同じ崩れ方を繰り返させないため。"""
+    return temperature if attempt == 0 else min(temperature + 0.1 * attempt, 1.0)
+
+
 def get_structured_llm(
     schema,
     provider: str = None,
@@ -307,24 +319,17 @@ def get_structured_llm(
 
     Args:
         schema: Pydantic BaseModel または dict (JSON Schema)
-        provider: プロバイダー名
-        model: モデル名
-        temperature: 温度
-        max_tokens: 最大トークン数
-        track_usage: 使用量トラッキング
+        provider, model, temperature, max_tokens, track_usage, **kwargs: get_llm と同じ
 
     Returns:
         Runnable: schema型を返すRunnable
 
     Example:
-        from pydantic import BaseModel
-
         class Colors(BaseModel):
             colors: list[str]
 
-        llm = get_structured_llm(Colors, "openai", "gpt-4o")
-        result = llm.invoke("3つの色を返して")
-        print(result.colors)  # ['red', 'blue', 'green']
+        llm = get_structured_llm(Colors, "openai", "gpt-5.2")
+        print(llm.invoke("3つの色を返して").colors)
     """
     llm = get_llm(
         provider=provider,
@@ -347,26 +352,11 @@ def invoke(
     track_usage: bool = True,
 ) -> str:
     """
-    シンプルなテキスト呼び出し
-
-    Args:
-        prompt: プロンプト
-        provider: プロバイダー名
-        model: モデル名
-        system_prompt: システムプロンプト
-        temperature: 温度
-        max_tokens: 最大トークン数
-        track_usage: 使用量トラッキング
-
-    Returns:
-        str: レスポンステキスト
+    プロンプト 1 本を送り、返事の文字列を返す
 
     Example:
-        text = invoke("Hello!", provider="vertex", model="gemini-2.0-flash")
-        print(text)
+        text = invoke("Hello!", provider="vertex", model="gemini-3-flash-preview")
     """
-    from langchain_core.messages import HumanMessage, SystemMessage
-
     llm = get_llm(
         provider=provider,
         model=model,
@@ -374,14 +364,7 @@ def invoke(
         max_tokens=max_tokens,
         track_usage=track_usage,
     )
-
-    messages = []
-    if system_prompt:
-        messages.append(SystemMessage(content=system_prompt))
-    messages.append(HumanMessage(content=prompt))
-
-    response = llm.invoke(messages)
-    return response.content
+    return llm.invoke(_messages(prompt, system_prompt)).text
 
 
 def invoke_structured(
@@ -395,39 +378,15 @@ def invoke_structured(
     track_usage: bool = True,
 ):
     """
-    Structured Output呼び出し
-
-    Args:
-        prompt: プロンプト
-        schema: Pydantic BaseModel
-        provider: プロバイダー名
-        model: モデル名
-        system_prompt: システムプロンプト
-        temperature: 温度
-        max_tokens: 最大トークン数
-        track_usage: 使用量トラッキング
-
-    Returns:
-        schema型のインスタンス
+    プロンプト 1 本を送り、schema 型のインスタンスを返す（LangChain の with_structured_output）
 
     Example:
-        from pydantic import BaseModel
-
         class Answer(BaseModel):
             answer: str
             confidence: float
 
-        result = invoke_structured(
-            "What is 2+2?",
-            Answer,
-            provider="openai",
-            model="gpt-4o",
-        )
-        print(result.answer)  # "4"
-        print(result.confidence)  # 1.0
+        result = invoke_structured("What is 2+2?", Answer, provider="openai", model="gpt-5.2")
     """
-    from langchain_core.messages import HumanMessage, SystemMessage
-
     llm = get_structured_llm(
         schema=schema,
         provider=provider,
@@ -436,13 +395,7 @@ def invoke_structured(
         max_tokens=max_tokens,
         track_usage=track_usage,
     )
-
-    messages = []
-    if system_prompt:
-        messages.append(SystemMessage(content=system_prompt))
-    messages.append(HumanMessage(content=prompt))
-
-    return llm.invoke(messages)
+    return llm.invoke(_messages(prompt, system_prompt))
 
 
 async def ainvoke(
@@ -454,23 +407,7 @@ async def ainvoke(
     max_tokens: int = 4096,
     track_usage: bool = True,
 ) -> str:
-    """
-    シンプルなテキスト呼び出し（非同期版）
-
-    Args:
-        prompt: プロンプト
-        provider: プロバイダー名
-        model: モデル名
-        system_prompt: システムプロンプト
-        temperature: 温度
-        max_tokens: 最大トークン数
-        track_usage: 使用量トラッキング
-
-    Returns:
-        str: レスポンステキスト
-    """
-    from langchain_core.messages import HumanMessage, SystemMessage
-
+    """invoke の非同期版"""
     llm = get_llm(
         provider=provider,
         model=model,
@@ -478,14 +415,8 @@ async def ainvoke(
         max_tokens=max_tokens,
         track_usage=track_usage,
     )
-
-    messages = []
-    if system_prompt:
-        messages.append(SystemMessage(content=system_prompt))
-    messages.append(HumanMessage(content=prompt))
-
-    response = await llm.ainvoke(messages)
-    return response.content
+    response = await _limited(llm.ainvoke(_messages(prompt, system_prompt)))
+    return response.text
 
 
 async def ainvoke_structured(
@@ -502,44 +433,24 @@ async def ainvoke_structured(
     """
     Structured Output呼び出し（非同期版） - LangChain標準パース
 
-    LangChainのwith_structured_outputに任せるシンプル版。
-    パース失敗時は温度を上げてリトライする。
-
-    Args:
-        prompt: プロンプト
-        schema: Pydantic BaseModel
-        provider: プロバイダー名
-        model: モデル名
-        system_prompt: システムプロンプト
-        temperature: 温度
-        max_tokens: 最大トークン数
-        track_usage: 使用量トラッキング
-        max_retries: 最大リトライ回数（デフォルト3回）
-
-    Returns:
-        schema型のインスタンス
+    LangChain の with_structured_output（json_mode）に読ませる。読めなければ温度を
+    上げて、同じ文で送り直す。誤りを添えて送り直すなら ainvoke_structured_with_retry。
 
     Raises:
-        LLMResponseError: リトライ後もパースに失敗した場合
+        LLMResponseError: max_retries 回送っても読めなかった場合
     """
-    from langchain_core.messages import HumanMessage, SystemMessage
     from .exceptions import LLMResponseError
 
-    messages = []
-    if system_prompt:
-        messages.append(SystemMessage(content=system_prompt))
-    messages.append(HumanMessage(content=prompt))
+    messages = _messages(prompt, system_prompt)
 
     async def _invoke_with_retry():
         last_error_msg = None
 
         for attempt in range(max_retries):
-            current_temp = temperature if attempt == 0 else min(temperature + 0.1 * attempt, 1.0)
-
             llm = get_llm(
                 provider=provider,
                 model=model,
-                temperature=current_temp,
+                temperature=_retry_temperature(temperature, attempt),
                 max_tokens=max_tokens,
                 track_usage=track_usage,
             )
@@ -551,7 +462,6 @@ async def ainvoke_structured(
             if parsed is not None:
                 return parsed
 
-            # パース失敗時の情報を保存
             raw_message = result.get("raw")
             raw_content = raw_message.content if raw_message else None
             parsing_error = result.get("parsing_error")
@@ -568,12 +478,7 @@ async def ainvoke_structured(
 
         raise LLMResponseError(last_error_msg)
 
-    semaphore = _llm_semaphore
-    if semaphore is not None:
-        async with semaphore:
-            return await _invoke_with_retry()
-    else:
-        return await _invoke_with_retry()
+    return await _limited(_invoke_with_retry())
 
 
 async def ainvoke_structured_with_retry(
@@ -591,106 +496,64 @@ async def ainvoke_structured_with_retry(
     Structured Output呼び出し（非同期版） - ソフトバリデーション＋フィードバック付きリトライ
 
     LangChainのパースに頼らず、自前でバリデーション・修復・リトライを行う。
-    リトライ時は前回の出力とエラー内容をLLMにフィードバックして再出力を促す。
 
     リトライ戦略:
-    1. LLMにJSON mode で出力させ、自前でパース
-    2. パース失敗 → ソフトバリデーション（型変換・フィールド名修復等）で修復
-    3. 修復も失敗 → 前回出力とエラーをフィードバックしてリトライ
-
-    Args:
-        prompt: プロンプト
-        schema: Pydantic BaseModel
-        provider: プロバイダー名
-        model: モデル名
-        system_prompt: システムプロンプト
-        temperature: 温度
-        max_tokens: 最大トークン数
-        track_usage: 使用量トラッキング
-        max_retries: 最大リトライ回数（デフォルト3回）
-
-    Returns:
-        schema型のインスタンス
+    1. スキーマを LLM の機能としては渡さず、文の末尾の指示（json_output_instruction）で JSON を書かせる
+    2. 返事を緩く読み直す（try_lenient_parse: 前後の文・切れた JSON・名前・型を直す）
+    3. それでも読めなければ、前回の出力と誤りを添えて、温度を上げて送り直す
 
     Raises:
-        LLMResponseError: リトライ後もパースに失敗した場合
+        LLMResponseError: max_retries 回送っても読めなかった場合
     """
-    from langchain_core.messages import HumanMessage, SystemMessage
     from .exceptions import LLMResponseError
     from .utils import try_lenient_parse, build_retry_messages, json_output_instruction
 
-    original_messages = []
-    if system_prompt:
-        original_messages.append(SystemMessage(content=system_prompt))
-    # 初回から schema を明示（付けないとモデルが地の文で返しパース失敗→リトライになりやすい）
-    original_messages.append(HumanMessage(content=prompt + json_output_instruction(schema)))
+    original_messages = _messages(prompt + json_output_instruction(schema), system_prompt)
+    schema_name = getattr(schema, "__name__", str(schema))
 
     async def _invoke_with_retry():
-        last_error_msg = None
-        current_messages = list(original_messages)
-
-        schema_name = schema.__name__ if hasattr(schema, '__name__') else str(schema)
-        logger.info(f"ainvoke_structured_with_retry called, schema={schema_name}")
+        current_messages = original_messages
+        error_detail = "出力がスキーマに適合しませんでした"
+        raw = ""
 
         for attempt in range(max_retries):
-            current_temp = temperature if attempt == 0 else min(temperature + 0.1 * attempt, 1.0)
-
             llm = get_llm(
                 provider=provider,
                 model=model,
-                temperature=current_temp,
+                temperature=_retry_temperature(temperature, attempt),
                 max_tokens=max_tokens,
                 track_usage=track_usage,
             )
 
-            # スキーマを渡さず、JSON mode のみで出力させる
             response = await llm.ainvoke(current_messages)
-            raw_content = response.content if response else ""
-            # content が content blocks のリストの場合、text ブロックを結合
-            if isinstance(raw_content, list):
-                raw_content_str = "\n".join(
-                    block["text"] for block in raw_content
-                    if isinstance(block, dict) and block.get("type") == "text"
-                )
-            else:
-                raw_content_str = str(raw_content) if raw_content else ""
+            raw = response.text if response else ""
 
-            # === Step 1: 自前パース（ソフトバリデーション込み） ===
-            parsed = try_lenient_parse(raw_content_str, schema)
+            parsed = try_lenient_parse(raw, schema)
             if parsed is not None:
                 if attempt > 0:
-                    logger.info(f"attempt {attempt + 1}/{max_retries}: OK (retryで成功)")
+                    logger.info("%s: attempt %d/%d で読めた", schema_name, attempt + 1, max_retries)
                 return parsed
 
-            # === Step 2: パース失敗 → フィードバック付きリトライ準備 ===
             # モデルの出力は利用者の発言を引くことがあるので、ログと例外には長さだけを出す。
             logger.warning(
-                f"attempt {attempt + 1}/{max_retries}: parse failed | "
-                f"raw_len={len(raw_content_str)}"
-            )
-
-            error_detail = "出力がスキーマに適合しませんでした"
-            last_error_msg = (
-                f"Structured output parsing failed | Error: {error_detail} | raw_len={len(raw_content_str)}"
+                "%s: attempt %d/%d parse failed | raw_len=%d",
+                schema_name, attempt + 1, max_retries, len(raw),
             )
 
             if attempt < max_retries - 1:
                 current_messages = build_retry_messages(
                     original_messages=original_messages,
-                    raw_output=raw_content_str,
+                    raw_output=raw,
                     error_detail=error_detail,
                     schema=schema,
                 )
                 await asyncio.sleep(2.0)
 
-        raise LLMResponseError(last_error_msg)
+        raise LLMResponseError(
+            f"Structured output parsing failed | Error: {error_detail} | raw_len={len(raw)}"
+        )
 
-    semaphore = _llm_semaphore
-    if semaphore is not None:
-        async with semaphore:
-            return await _invoke_with_retry()
-    else:
-        return await _invoke_with_retry()
+    return await _limited(_invoke_with_retry())
 
 
 def stream(
@@ -703,26 +566,12 @@ def stream(
     track_usage: bool = True,
 ):
     """
-    ストリーミング呼び出し
-
-    Args:
-        prompt: プロンプト
-        provider: プロバイダー名
-        model: モデル名
-        system_prompt: システムプロンプト
-        temperature: 温度
-        max_tokens: 最大トークン数
-        track_usage: 使用量トラッキング
-
-    Yields:
-        str: チャンクテキスト
+    プロンプト 1 本を送り、返事を届いた分ずつ文字列で返す
 
     Example:
         for text in stream("Tell me a story"):
             print(text, end="", flush=True)
     """
-    from langchain_core.messages import HumanMessage, SystemMessage
-
     llm = get_llm(
         provider=provider,
         model=model,
@@ -730,14 +579,8 @@ def stream(
         max_tokens=max_tokens,
         track_usage=track_usage,
     )
-
-    messages = []
-    if system_prompt:
-        messages.append(SystemMessage(content=system_prompt))
-    messages.append(HumanMessage(content=prompt))
-
-    for chunk in llm.stream(messages):
-        yield chunk.content
+    for chunk in llm.stream(_messages(prompt, system_prompt)):
+        yield chunk.text
 
 
 async def astream(
@@ -750,26 +593,12 @@ async def astream(
     track_usage: bool = True,
 ):
     """
-    ストリーミング呼び出し（非同期版）
-
-    Args:
-        prompt: プロンプト
-        provider: プロバイダー名
-        model: モデル名
-        system_prompt: システムプロンプト
-        temperature: 温度
-        max_tokens: 最大トークン数
-        track_usage: 使用量トラッキング
-
-    Yields:
-        str: チャンクテキスト
+    stream の非同期版
 
     Example:
         async for text in astream("Tell me a story"):
             print(text, end="", flush=True)
     """
-    from langchain_core.messages import HumanMessage, SystemMessage
-
     llm = get_llm(
         provider=provider,
         model=model,
@@ -777,25 +606,8 @@ async def astream(
         max_tokens=max_tokens,
         track_usage=track_usage,
     )
-
-    messages = []
-    if system_prompt:
-        messages.append(SystemMessage(content=system_prompt))
-    messages.append(HumanMessage(content=prompt))
-
-    async for chunk in llm.astream(messages):
-        content = chunk.content
-        # content がリストの場合は文字列に変換
-        if isinstance(content, list):
-            # 各要素からテキストを抽出
-            text_parts = []
-            for item in content:
-                if isinstance(item, str):
-                    text_parts.append(item)
-                elif isinstance(item, dict) and "text" in item:
-                    text_parts.append(item["text"])
-            content = "".join(text_parts)
-        yield content if content else ""
+    async for chunk in llm.astream(_messages(prompt, system_prompt)):
+        yield chunk.text
 
 
 # ═══════════════════════════════════════════════════════════════════════════

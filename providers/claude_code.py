@@ -35,7 +35,7 @@ import logging
 import shutil
 import subprocess
 import time
-from typing import Any, Optional, Sequence, Type, Union
+from typing import Any, Optional, Type, Union
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
@@ -53,6 +53,7 @@ from langchain_core.runnables import Runnable, RunnableLambda
 from pydantic import BaseModel, ConfigDict, Field
 
 from .. import usage_tracker
+from ..config import DEFAULT_MODELS
 from ..exceptions import LLMAPIError, LLMConfigError, LLMResponseError
 
 logger = logging.getLogger(__name__)
@@ -89,8 +90,8 @@ class ChatClaudeCode(BaseChatModel):
     # pydantic が `model_` 名前空間を保護するため無効化（`model` フィールドを使う）
     model_config = ConfigDict(protected_namespaces=())
 
-    model: str = "claude-sonnet-4-6"
-    """使用モデル。エイリアス（sonnet/opus）または正式名（claude-sonnet-4-6 等）"""
+    model: str = DEFAULT_MODELS["claude_code"]
+    """使用モデル。エイリアス（sonnet/opus）または正式名（claude-sonnet-5-5 等）"""
 
     cli_path: str = "claude"
     """claude CLI の実行パス"""
@@ -205,9 +206,26 @@ class ChatClaudeCode(BaseChatModel):
         args += list(self.extra_args)
         return args
 
+    def _command(self, messages: list[BaseMessage]) -> tuple[list[str], str]:
+        """(CLI の引数, 標準入力に渡すプロンプト)。CLI が無ければ LLMConfigError。"""
+        if shutil.which(self.cli_path) is None and "/" not in self.cli_path:
+            raise LLMConfigError(
+                f"Claude Code CLI not found: '{self.cli_path}'. Install it or set cli_path."
+            )
+        system_parts, prompt = self._messages_to_prompt(messages)
+        return self._build_args(system_parts), prompt
+
     # ------------------------------------------------------------------
     # レスポンス解析
     # ------------------------------------------------------------------
+    def _raise_on_exit(self, returncode: int, stderr: str) -> None:
+        if returncode != 0:
+            raise LLMAPIError(
+                f"Claude Code CLI exited with code {returncode}: {stderr.strip()[:500]}",
+                provider=PROVIDER_NAME,
+                status_code=returncode,
+            )
+
     def _parse_payload(self, stdout: str) -> dict:
         stdout = stdout.strip()
         if not stdout:
@@ -287,13 +305,7 @@ class ChatClaudeCode(BaseChatModel):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> ChatResult:
-        if shutil.which(self.cli_path) is None and "/" not in self.cli_path:
-            raise LLMConfigError(
-                f"Claude Code CLI not found: '{self.cli_path}'. Install it or set cli_path."
-            )
-
-        system_parts, prompt = self._messages_to_prompt(messages)
-        args = self._build_args(system_parts)
+        args, prompt = self._command(messages)
 
         start = time.time()
         try:
@@ -311,13 +323,7 @@ class ChatClaudeCode(BaseChatModel):
             )
         elapsed = time.time() - start
 
-        if proc.returncode != 0:
-            raise LLMAPIError(
-                f"Claude Code CLI exited with code {proc.returncode}: {proc.stderr.strip()[:500]}",
-                provider=PROVIDER_NAME,
-                status_code=proc.returncode,
-            )
-
+        self._raise_on_exit(proc.returncode, proc.stderr)
         payload = self._parse_payload(proc.stdout)
         return self._build_result(payload, elapsed)
 
@@ -331,13 +337,7 @@ class ChatClaudeCode(BaseChatModel):
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> ChatResult:
-        if shutil.which(self.cli_path) is None and "/" not in self.cli_path:
-            raise LLMConfigError(
-                f"Claude Code CLI not found: '{self.cli_path}'. Install it or set cli_path."
-            )
-
-        system_parts, prompt = self._messages_to_prompt(messages)
-        args = self._build_args(system_parts)
+        args, prompt = self._command(messages)
 
         start = time.time()
         proc = await asyncio.create_subprocess_exec(
@@ -359,14 +359,7 @@ class ChatClaudeCode(BaseChatModel):
             )
         elapsed = time.time() - start
 
-        if proc.returncode != 0:
-            raise LLMAPIError(
-                f"Claude Code CLI exited with code {proc.returncode}: "
-                f"{stderr_b.decode('utf-8', 'replace').strip()[:500]}",
-                provider=PROVIDER_NAME,
-                status_code=proc.returncode,
-            )
-
+        self._raise_on_exit(proc.returncode, stderr_b.decode("utf-8", "replace"))
         payload = self._parse_payload(stdout_b.decode("utf-8", "replace"))
         return self._build_result(payload, elapsed)
 
@@ -400,10 +393,13 @@ class ChatClaudeCode(BaseChatModel):
         def _parse(message: AIMessage):
             data = message.additional_kwargs.get("structured_output")
             if data is None:
-                # フォールバック: content を JSON として解釈
-                from ..utils import parse_json
+                # フォールバック: 本文から JSON を取り出して読む
+                from ..utils import extract_json
 
-                data = parse_json(_extract_text(message.content))
+                json_str = extract_json(message.text)
+                if json_str is None:
+                    raise LLMResponseError(f"No JSON object in Claude Code output | raw_len={len(message.text)}")
+                data = json.loads(json_str)
             return schema.model_validate(data) if is_pydantic else data
 
         parser = RunnableLambda(_parse)

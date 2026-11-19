@@ -1,4 +1,4 @@
-# llm-kit
+# llm_kit
 
 LLM を呼ぶときに毎回要る機能を、ひととおり先に作っておいたライブラリ。
 中身は LangChain の上に作ってあり、`get_llm()` が返すのは LangChain のチャットモデルなので、LangGraph にもそのまま渡せる。
@@ -6,27 +6,25 @@ LLM を呼ぶときに毎回要る機能を、ひととおり先に作ってお�
 ## できること
 
 - **プロバイダの切り替え**: `get_llm(provider, model)` の引数を変えるだけで、OpenAI・Anthropic・Google（Gemini API）・Vertex・Bedrock・Claude Code（CLI 経由）を切り替える
-- **構造化出力**: `invoke_structured` / `ainvoke_structured`。`ainvoke_structured_with_retry` は、返ってきた JSON が崩れていたらまず緩く読み直し、それでも読めなければ誤りを添えて送り直す（既定で最大 3 回）
-- **ストリーミング**: `stream`、およびツール呼び出しの引数を届いた分から受け取る `astream_tool_calls`（OpenAI・Vertex）
-- **同時に呼ぶ数の上限**: `configure_llm_concurrency`
-- **利用量と料金の集計**: トークン数を数えて料金（ドル・円）を出す。`print_usage_summary` / `estimate_cost` など。料金表は `llm_kit/config.py`
+- **文字列で受ける**: `invoke` / `ainvoke` / `stream` / `astream`。返事がブロックの list で届くモデル（Gemini 3 など）でも、文字のブロックだけを繋いだ文字列を返す
+- **構造化出力**: `invoke_structured` / `ainvoke_structured`。`ainvoke_structured_with_retry` は、返ってきた JSON が崩れていたらまず緩く読み直し（前後の地の文・途中で切れた JSON・camelCase の名前を直す）、それでも読めなければ誤りを添えて送り直す（既定で最大 3 回）
+- **ストリーミング**: `stream` / `astream`、およびツール呼び出しの引数を届いた分から受け取る `astream_tool_calls`（OpenAI・Vertex）
+- **同時に呼ぶ数の上限**: `configure_llm_concurrency`。`ainvoke` と `ainvoke_structured` 系に効く
+- **利用量と料金の集計**: トークン数を数えて料金（ドル・円）を出す。`print_usage_summary` / `estimate_cost` など。料金表は `llm_kit/config.py`（2026-11-19 に各社の公式の値と突き合わせた。Vercel AI Gateway の判定モデル `typesafe-ai/jev` などは provider `"gateway"` で引く）。料金表に無いモデルは 0 ドルとして数え、モデルごとに 1 度だけ警告を出す
 - **埋め込み**: `embed_query` / `embed_documents`（同期・非同期）
 - **リランク**: `rerank`（Bedrock 経由の Cohere か、Cohere の API）
-- **ベクトル検索の置き場**: `SqliteBackend`（sqlite-vec）
 
 ## 入れ方
 
+このリポジトリの直下が、パッケージ `llm_kit` そのもの。clone するときはフォルダ名を `llm_kit` にすると、その親から `import llm_kit` できる。
 使うプロバイダの分だけ追加の依存を付ける（`pyproject.toml` の `optional-dependencies`）。
 
 ```bash
 # GitHub から
 uv add "llm-kit[openai,google] @ git+https://github.com/au6000/llm_kit.git"
 
-# 全部入れる
-uv add "llm-kit[all] @ git+https://github.com/au6000/llm_kit.git"
-
-# 手元に clone したものを、直しながら使う
-uv add --editable "llm-kit[openai,google] @ file:///path/to/llm-kit"
+# 手元の clone を、直しながら使う（llm_kit/ の親で）
+pip install -e "./llm_kit[openai,google]"
 ```
 
 | 追加の依存 | 使う機能 |
@@ -37,7 +35,10 @@ uv add --editable "llm-kit[openai,google] @ file:///path/to/llm-kit"
 | `vertex-embeddings` | Vertex の埋め込み |
 | `bedrock` | `get_llm("bedrock")`・リランクの Bedrock 経路 |
 | `cohere` | リランクの Cohere 経路 |
-| `sqlite` | `SqliteBackend` |
+| `all` | 上の全部 |
+
+`import llm_kit` だけでは LangChain を読まない。`get_llm` などの名前を初めて使った時点で、その部品を読む（`__init__.py`）。
+依存を入れていない環境でも `import llm_kit` は通るので、別のプロジェクトの中に置いても、そのプロジェクトの検査の探索で落ちない。
 
 ## 使い方
 
@@ -47,13 +48,13 @@ from pydantic import BaseModel
 
 # provider と model を省くと llm_kit/config.py の既定（vertex）を使う
 llm = get_llm("vertex", "gemini-3-flash-preview")
-print(llm.invoke("こんにちは").content)
+print(llm.invoke("こんにちは").text)
 
 class Answer(BaseModel):
     answer: str
     confidence: float
 
-result = invoke_structured("2+2 は？", Answer, provider="openai", model="gpt-5.2")
+result = invoke_structured("2+2 は？", Answer, provider="openai", model="gpt-6.2-sol")
 print(result.answer)
 
 print_usage_summary()
@@ -61,7 +62,7 @@ print_usage_summary()
 
 ## 環境変数
 
-**import した時点で、カレントディレクトリの `.env` を読み込む**（`llm_kit/utils.py` の `load_dotenv()`）。
+**`get_llm` などを初めて使った時点で、カレントディレクトリの `.env` を読み込む**（`llm_kit/utils.py` の `load_dotenv()`）。
 
 | プロバイダ | 変数 |
 |---|---|
@@ -75,10 +76,16 @@ print_usage_summary()
 
 ## テスト
 
+検査は `tests/` にある。ネットワークも鍵も使わない（モデルは偽物に、Claude Code の CLI はサブプロセスの呼び出しに差し替える）。
+`llm_kit/` の**親**で流す。`llm_kit/` の中で流すと、`types.py` などが標準ライブラリの同じ名前の部品を覆い隠す。
+
 ```bash
-uv sync --extra openai --extra google
-uv run python -m unittest discover -s tests
+pip install -e "./llm_kit[openai,google]"
+python -m unittest discover -s llm_kit/tests -t .
 ```
+
+依存（langchain-core など）が無ければ検査は丸ごと飛ばし、`google` が無ければ Vertex のストリームを開く検査だけを飛ばす。
+別のプロジェクトの直下に `llm_kit/` として置いているなら、そのプロジェクトの `python -m unittest` でも一緒に流れる。
 
 ## コメントにある数字
 
