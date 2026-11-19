@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+
+# 鍵・環境変数
+.env
+.env.*
+!.env.example
+*credentials*.json
+gen-lang-client-*.json

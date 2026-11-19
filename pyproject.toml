@@ -1,0 +1,37 @@
+[project]
+name = "llm-kit"
+version = "1.0.0"
+description = "LLM を呼ぶときに要る機能（プロバイダの切り替え・構造化出力・ストリーミング・利用量の集計・埋め込み・リランク）をひととおり揃えたライブラリ"
+readme = "README.md"
+requires-python = ">=3.12"
+
+# import しただけで読み込まれるものだけを必須にする。
+# 下限は、このライブラリが実際に動いていた環境の版。
+dependencies = [
+    "langchain-core>=1.5.6",
+    "pydantic>=2.13.4",
+    "python-dotenv>=1.2.3",
+    "httpx>=0.28.1",
+]
+
+# プロバイダごとのライブラリは、使うときに関数の中で import している。使う分だけ入れる。
+[project.optional-dependencies]
+openai = ["langchain-openai>=1.5.2"]
+anthropic = ["langchain-anthropic"]
+# get_llm("google") と get_llm("vertex") の両方。Vertex も langchain-google-genai 経由で呼ぶ。
+google = ["langchain-google-genai>=4.3.4", "google-auth>=2.56.3"]
+# 埋め込みの "vertex" だけが使う。
+vertex-embeddings = ["langchain-google-vertexai"]
+# get_llm("bedrock") と、リランクの Bedrock 経路。
+bedrock = ["langchain-aws", "boto3>=1.43.114"]
+cohere = ["cohere"]
+# query_backend の SqliteBackend。
+sqlite = ["sqlite-vec"]
+all = ["llm-kit[openai,anthropic,google,vertex-embeddings,bedrock,cohere,sqlite]"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["llm_kit"]
