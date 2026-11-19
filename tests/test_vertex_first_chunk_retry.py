@@ -5,13 +5,20 @@
 """
 
 import asyncio
-import sys
 import unittest
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+try:
+    import httpx  # noqa: F401
+    import langchain_core  # noqa: F401
+except ImportError:
+    raise unittest.SkipTest("llm_kit の依存 (langchain-core など) がない")
 
-import httpx  # noqa: E402
+try:
+    import google.genai  # noqa: F401
+    import langchain_google_genai  # noqa: F401
+    HAS_GOOGLE = True
+except ImportError:
+    HAS_GOOGLE = False
 
 from llm_kit.providers import vertex  # noqa: E402
 
@@ -134,6 +141,7 @@ def _run_stream(bounded: bool, opener):
     return seen
 
 
+@unittest.skipUnless(HAS_GOOGLE, "追加の依存 google がない")
 class Bounded(unittest.TestCase):
     """1 ターンに時間がかかる前提の呼び出しは bounded=False で呼び、打ち切りも送り直しもしない。"""
 

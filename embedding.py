@@ -3,7 +3,6 @@
 """
 
 import warnings
-from typing import Optional
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain_google_vertexai")
