@@ -6,6 +6,7 @@ LangChain の実行イベントからその数字を拾うコールバックを�
 """
 
 import json
+import logging
 from collections import deque
 import threading
 import time
@@ -22,6 +23,15 @@ from .utils import get_pricing
 
 #: 明細（`details` で返すもの）を持つ件数の上限。
 _MAX_RECORDS = 1000
+
+# 呼び出しごとの 1 行は、この名前のロガーに出す。
+_usage_log = logging.getLogger("usage")
+
+
+def _cost_usd(provider: str, model: str, input_tokens: int, output_tokens: int) -> float:
+    """料金表（USD / 100 万トークン）から 1 回分の料金を出す。"""
+    pricing = get_pricing(provider, model)
+    return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
 
 
 class UsageTracker:
@@ -58,11 +68,7 @@ class UsageTracker:
         応答の最初のかたまりまでの秒数。どちらも分かるプロバイダーだけが渡す。応答が遅かった
         ときに「モデルが長く考えていた」のか「プロバイダーで待たされた」のかを分けるため。
         """
-        if cost_usd is not None:
-            cost = cost_usd
-        else:
-            pricing = get_pricing(provider, model)
-            cost = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+        cost = cost_usd if cost_usd is not None else _cost_usd(provider, model, input_tokens, output_tokens)
 
         record = UsageRecord(
             provider=provider,
@@ -78,13 +84,12 @@ class UsageTracker:
         # 呼び出しごとに 1 行出す。応答が遅かったとき、考えた分（think）と最初のかたまりまでの
         # 秒数（first）から、モデルが長く考えていたのか、プロバイダーで待たされたのかを分ける
         # （1 回の呼び出しが 48 秒待ったのに、out は 36 トークンだった実測がある）。
-        import logging as _logging
         extra = ""
         if thinking_tokens is not None:
             extra += f" think={thinking_tokens}"
         if first_chunk_seconds is not None:
             extra += f" first={first_chunk_seconds:.2f}"
-        _logging.getLogger("usage").info(
+        _usage_log.info(
             "[usage] model=%s in=%d out=%d elapsed=%.2f%s",
             model, input_tokens, output_tokens, elapsed_time, extra,
         )
@@ -156,12 +161,13 @@ class UsageTracker:
 
     def reset(self):
         """統計をリセット"""
-        self._records = deque(maxlen=_MAX_RECORDS)
-        self._call_count = 0
-        self._total_input_tokens = 0
-        self._total_output_tokens = 0
-        self._total_cost_usd = 0.0
-        self._total_elapsed_time = 0.0
+        with self._lock:
+            self._records = deque(maxlen=_MAX_RECORDS)
+            self._call_count = 0
+            self._total_input_tokens = 0
+            self._total_output_tokens = 0
+            self._total_cost_usd = 0.0
+            self._total_elapsed_time = 0.0
 
     def print_summary(self):
         """使用量サマリーを出力"""
@@ -182,29 +188,13 @@ class UsageTracker:
             "summary": self.summary(),
             "details": self.details(),
         }
-        Path(filepath).write_text(json.dumps(data, ensure_ascii=False, indent=2))
-
-    def load_from_file(self, filepath: str):
-        """JSONファイルから使用量を読み込み（累積）"""
-        data = json.loads(Path(filepath).read_text())
-        for record in data.get("details", []):
-            self.add(
-                provider=record["provider"],
-                model=record["model"],
-                input_tokens=record["input_tokens"],
-                output_tokens=record["output_tokens"],
-            )
+        Path(filepath).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # =============================================================================
 # グローバルインスタンス
 # =============================================================================
 _default_tracker = UsageTracker()
-
-
-def get_default_tracker() -> UsageTracker:
-    """デフォルトトラッカーを取得"""
-    return _default_tracker
 
 
 def add_usage(
@@ -273,8 +263,7 @@ def estimate_cost(
             "cost_jpy": float,
         }
     """
-    pricing = get_pricing(provider, model)
-    cost_usd = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+    cost_usd = _cost_usd(provider, model, input_tokens, output_tokens)
     cost_jpy = cost_usd * USD_TO_JPY
 
     return {

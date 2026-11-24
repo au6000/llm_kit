@@ -5,13 +5,22 @@
 """
 
 import asyncio
-import sys
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+try:
+    import httpx  # noqa: F401
+    import langchain_core  # noqa: F401
+except ImportError:
+    raise unittest.SkipTest("llm_kit の依存 (langchain-core など) がない")
+
+try:
+    import google.genai  # noqa: F401
+    import langchain_google_genai  # noqa: F401
+    HAS_GOOGLE = True
+except ImportError:
+    HAS_GOOGLE = False
 
 from llm_kit import usage_tracker  # noqa: E402
 from llm_kit.providers import vertex  # noqa: E402
@@ -55,6 +64,7 @@ class UsageLogLine(unittest.TestCase):
         self.assertTrue(logs.output[0].endswith("in=991 out=61 elapsed=0.00"))
 
 
+@unittest.skipUnless(HAS_GOOGLE, "追加の依存 google がない")
 class StreamTiming(unittest.TestCase):
     def test_ストリームの終わりに時間と考えた分を渡す(self):
         async def chunks():
